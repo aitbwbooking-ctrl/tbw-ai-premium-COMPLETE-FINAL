@@ -11,6 +11,7 @@ export default function BookingModal({ open, onClose, context }) {
 
   const recRef = useRef(null);
   const timerRef = useRef(null);
+  const openedRef = useRef(false); // ⬅️ sprječava duplo otvaranje
 
   const [listening, setListening] = useState(false);
   const [log, setLog] = useState([]);
@@ -19,29 +20,30 @@ export default function BookingModal({ open, onClose, context }) {
     city: null,
     persons: null,
     dates: null,
-    priorities: [],
+    intent: null,
   });
 
   /* ========== INIT ========= */
   useEffect(() => {
     if (!open) {
       stopVoice();
+      openedRef.current = false;
       setLog([]);
       setState({
         city: null,
         persons: null,
         dates: null,
-        priorities: [],
+        intent: null,
       });
       return;
     }
 
     if (context?.raw) {
-      extractFromContext(context.raw);
+      bootstrapFromContext(context.raw);
     }
 
     speak(
-      "Mogu li vam pomoći u izboru najpovoljnijeg smještaja? Recite za koliko osoba tražite i koje su vam želje.",
+      "U redu. Pronalazim najpovoljnije opcije. Recite još samo za koliko osoba.",
       { priority: "normal" }
     );
 
@@ -84,35 +86,69 @@ export default function BookingModal({ open, onClose, context }) {
     setListening(false);
   };
 
-  /* ========== PROCESS ========= */
-  const extractFromContext = (text) => {
-    const dates = parseHumanDates(text);
-    if (dates) setState((s) => ({ ...s, dates }));
-  };
+  /* ========== CONTEXT ========= */
+  const bootstrapFromContext = (text) => {
+    const lower = text.toLowerCase();
 
-  const handleInput = (text) => {
-    setLog((l) => [...l, { from: "user", text }]);
+    if (lower.includes("najpovoljn")) {
+      setState((s) => ({ ...s, intent: "cheap" }));
+    }
 
     const dates = parseHumanDates(text);
     if (dates) {
       setState((s) => ({ ...s, dates }));
     }
+  };
 
+  /* ========== PROCESS ========= */
+  const handleInput = (text) => {
+    setLog((l) => [...l, { from: "user", text }]);
+
+    const lower = text.toLowerCase();
+
+    // persons
     const num = text.match(/\d+/);
     if (num) {
       setState((s) => ({ ...s, persons: num[0] }));
-      speak(`U redu. ${num[0]} osoba. Imate li budžet ili posebne zahtjeve?`);
-      return;
+      speak(`U redu. ${num[0]} osoba.`);
     }
 
-    if (text.toLowerCase().includes("pokaži") || text.toLowerCase().includes("nađi")) {
+    // intent
+    if (
+      lower.includes("najpovoljn") ||
+      lower.includes("jeftin") ||
+      lower.includes("apartman") ||
+      lower.includes("hotel")
+    ) {
+      setState((s) => ({ ...s, intent: "stay" }));
+    }
+
+    // dates
+    const dates = parseHumanDates(text);
+    if (dates) {
+      setState((s) => ({ ...s, dates }));
+    }
+
+    tryAutoOpen();
+  };
+
+  /* ========== AUTO OPEN ========= */
+  const tryAutoOpen = () => {
+    if (openedRef.current) return;
+
+    const filled =
+      (state.intent ? 1 : 0) +
+      (state.persons ? 1 : 0) +
+      (state.dates ? 1 : 0);
+
+    if (filled >= 2) {
+      openedRef.current = true;
+
+      speak("Otvaram najbolje dostupne ponude prema vašim kriterijima.");
+
       const url = buildAffiliateUrl(state);
       window.open(url, "_blank");
-      speak("Otvaram najbolje dostupne opcije prema vašim kriterijima.");
-      return;
     }
-
-    speak("Razumijem. Možete mi reći još detalja ili reći pokaži ponudu.");
   };
 
   return (
