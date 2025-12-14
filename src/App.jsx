@@ -1,5 +1,9 @@
 import React, { useEffect, useRef, useState } from "react";
 import BookingModal from "./tbw/booking/BookingModal";
+import Header from "./tbw/layout/Header";
+import Hero from "./tbw/layout/Hero";
+import AISearch from "./tbw/search/AISearch";
+import StatusPanel from "./tbw/status/StatusPanel";
 import { speak } from "./tbw/core/voice";
 
 export default function App() {
@@ -11,6 +15,7 @@ export default function App() {
 
   const [bookingOpen, setBookingOpen] = useState(false);
   const [lastUtterance, setLastUtterance] = useState("");
+  const [systemRunning, setSystemRunning] = useState(true);
 
   /* ================= VOICE ENGINE ================= */
 
@@ -27,7 +32,8 @@ export default function App() {
     r.onresult = (e) => {
       if (speakingRef.current) return;
 
-      const text = e.results[e.results.length - 1][0].transcript.trim();
+      const text =
+        e.results[e.results.length - 1][0].transcript?.trim();
       if (!text) return;
 
       setLastUtterance(text);
@@ -56,7 +62,8 @@ export default function App() {
     if (
       lower.includes("smještaj") ||
       lower.includes("hotel") ||
-      lower.includes("apartman")
+      lower.includes("apartman") ||
+      lower.includes("booking")
     ) {
       openBooking(text);
     }
@@ -94,8 +101,21 @@ export default function App() {
     // eslint-disable-next-line
   }, []);
 
+  /* ================= UI ================= */
+
   return (
     <>
+      <Header />
+
+      <Hero />
+
+      <AISearch
+        systemRunning={systemRunning}
+        onOpenBooking={() => openBooking(lastUtterance)}
+      />
+
+      <StatusPanel />
+
       <BookingModal
         open={bookingOpen}
         onClose={() => setBookingOpen(false)}
