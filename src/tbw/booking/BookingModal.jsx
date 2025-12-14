@@ -4,7 +4,7 @@ import { speak } from "../core/voice";
 import { parseHumanDates } from "../core/dateParser";
 import { buildAffiliateUrl } from "../core/affiliate";
 
-const PAUSE = 1200;
+const PAUSE_MS = 1200;
 
 export default function BookingModal({ open, onClose, context }) {
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -13,44 +13,63 @@ export default function BookingModal({ open, onClose, context }) {
   const timerRef = useRef(null);
 
   const [listening, setListening] = useState(false);
-  const [conversation, setConversation] = useState([]);
+  const [log, setLog] = useState([]);
+
   const [state, setState] = useState({
-    city: context?.city || null,
+    city: null,
     persons: null,
-    dates: context?.dates || null,
+    dates: null,
     priorities: [],
   });
 
+  /* ========== INIT ========= */
   useEffect(() => {
-    if (!open) return stop();
+    if (!open) {
+      stopVoice();
+      setLog([]);
+      setState({
+        city: null,
+        persons: null,
+        dates: null,
+        priorities: [],
+      });
+      return;
+    }
+
+    if (context?.raw) {
+      extractFromContext(context.raw);
+    }
 
     speak(
-      "Mogu li vam pomoći u izboru najpovoljnijeg smještaja? Recite za koliko osoba tražite i koji su vam prioriteti.",
+      "Mogu li vam pomoći u izboru najpovoljnijeg smještaja? Recite za koliko osoba tražite i koje su vam želje.",
       { priority: "normal" }
     );
 
-    start();
+    startVoice();
     // eslint-disable-next-line
   }, [open]);
 
-  const start = () => {
+  /* ========== VOICE ========= */
+  const startVoice = () => {
     if (!SR) return;
-    stop();
+
+    stopVoice();
 
     const r = new SR();
     r.lang = navigator.language || "hr-HR";
-    r.interimResults = true;
     r.continuous = true;
+    r.interimResults = true;
 
     r.onresult = (e) => {
-      let t = "";
+      let txt = "";
       for (let i = e.resultIndex; i < e.results.length; i++) {
-        t += e.results[i][0].transcript;
+        txt += e.results[i][0].transcript;
       }
-      if (!t) return;
+      txt = txt.trim();
+      if (!txt) return;
 
       clearTimeout(timerRef.current);
-      timerRef.current = setTimeout(() => process(t), PAUSE);
+      timerRef.current = setTimeout(() => handleInput(txt), PAUSE_MS);
     };
 
     r.start();
@@ -58,29 +77,42 @@ export default function BookingModal({ open, onClose, context }) {
     setListening(true);
   };
 
-  const stop = () => {
-    try { recRef.current?.stop(); } catch {}
+  const stopVoice = () => {
+    try {
+      recRef.current?.stop();
+    } catch {}
     setListening(false);
   };
 
-  const process = (text) => {
-    setConversation((c) => [...c, { from: "user", text }]);
-
+  /* ========== PROCESS ========= */
+  const extractFromContext = (text) => {
     const dates = parseHumanDates(text);
     if (dates) setState((s) => ({ ...s, dates }));
+  };
 
-    if (text.match(/\d+/)) {
-      const p = text.match(/\d+/)[0];
-      setState((s) => ({ ...s, persons: p }));
-      speak(`U redu, ${p} osoba. Imate li budžet ili posebne zahtjeve?`);
+  const handleInput = (text) => {
+    setLog((l) => [...l, { from: "user", text }]);
+
+    const dates = parseHumanDates(text);
+    if (dates) {
+      setState((s) => ({ ...s, dates }));
+    }
+
+    const num = text.match(/\d+/);
+    if (num) {
+      setState((s) => ({ ...s, persons: num[0] }));
+      speak(`U redu. ${num[0]} osoba. Imate li budžet ili posebne zahtjeve?`);
       return;
     }
 
-    if (text.includes("pokaži") || text.includes("nađi")) {
+    if (text.toLowerCase().includes("pokaži") || text.toLowerCase().includes("nađi")) {
       const url = buildAffiliateUrl(state);
       window.open(url, "_blank");
-      speak("Otvaram najpovoljnije opcije prema vašim kriterijima.");
+      speak("Otvaram najbolje dostupne opcije prema vašim kriterijima.");
+      return;
     }
+
+    speak("Razumijem. Možete mi reći još detalja ili reći pokaži ponudu.");
   };
 
   return (
@@ -90,8 +122,10 @@ export default function BookingModal({ open, onClose, context }) {
       </div>
 
       <div style={{ marginTop: 14 }}>
-        {conversation.map((c, i) => (
-          <div key={i}><b>{c.from}:</b> {c.text}</div>
+        {log.map((x, i) => (
+          <div key={i}>
+            <b>{x.from}:</b> {x.text}
+          </div>
         ))}
       </div>
     </ModalShell>
