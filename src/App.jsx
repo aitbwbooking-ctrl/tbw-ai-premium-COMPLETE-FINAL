@@ -1,223 +1,261 @@
-import { useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
+import "./App.css";
 
-/* ================== PARTNER CONFIG ================== */
-const PARTNERS = {
-  booking: { enabled: false, affiliateId: "" },
-  airbnb: { enabled: false, affiliateId: "" },
-  expedia: { enabled: false, affiliateId: "" },
-};
+/* TBW CORE */
+import { t } from "./tbw/core/i18n";
+import { speak, makeRecognizer } from "./tbw/core/voice";
+import { detectContextTrigger, shouldBridgeToBooking } from "./tbw/core/contextBridge";
 
-/* ================== APP ================== */
+/* GATES */
+import PermissionGate from "./tbw/ui/PermissionGate";
+import LegalGate, { legalAccepted } from "./tbw/ui/LegalGate";
+import RobotGate, { robotOk } from "./tbw/ui/RobotGate";
+
+/* UI */
+import TickerNav from "./tbw/ui/TickerNav";
+
+/* BOOKING */
+import BookingModal from "./tbw/booking/BookingModal";
+
+/* PARENTAL */
+import ParentalPanel from "./tbw/parental/ParentalPanel";
+
+/* =========================================================
+   TBW AI PREMIUM — APP ROOT
+   ========================================================= */
+
 export default function App() {
-  const [activeWindow, setActiveWindow] = useState(null);
+  /* ---------- GLOBAL STATE ---------- */
+  const [navActive, setNavActive] = useState(true); // navigation always ON (locked)
+  const [navRisk, setNavRisk] = useState(false); // later fed by NavEngine (snow, closures, ETA drift)
 
+  /* ---------- GATES ---------- */
+  const [showLegal, setShowLegal] = useState(false);
+  const [showRobot, setShowRobot] = useState(false);
+  const [showPerm, setShowPerm] = useState(false);
+
+  /* ---------- BOOKING ---------- */
+  const [bookingOpen, setBookingOpen] = useState(false);
+  const [bookingSeed, setBookingSeed] = useState("");
+
+  /* ---------- PARENTAL ---------- */
+  const [parentalOpen, setParentalOpen] = useState(false);
+
+  /* ---------- TICKER ---------- */
+  const [criticalTicker, setCriticalTicker] = useState(null);
+  // { active:true, text:"NESREĆA 23 km ispred – smanjite brzinu" }
+
+  /* ---------- VOICE CONTEXT LISTENER ---------- */
+  const recRef = useRef(null);
+  const finalTextRef = useRef("");
+
+  /* =========================================================
+     BOOT SEQUENCE — HARD LOCKED
+     ========================================================= */
+  useEffect(() => {
+    // Order is locked: LEGAL → ROBOT → PERMISSIONS
+    if (!legalAccepted()) {
+      setShowLegal(true);
+      return;
+    }
+    if (!robotOk()) {
+      setShowRobot(true);
+      return;
+    }
+    setShowPerm(true);
+  }, []);
+
+  /* =========================================================
+     CONTEXTUAL AUTO-CONCIERGE BRIDGE (CACB™)
+     Navigation listens, Booking joins ONLY if needed
+     ========================================================= */
+  useEffect(() => {
+    if (!navActive) return;
+
+    const r = makeRecognizer({ continuous: true });
+    if (!r) return;
+
+    recRef.current = r;
+    finalTextRef.current = "";
+
+    r.onresult = (e) => {
+      let interim = "";
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const res = e.results[i];
+        const txt = res[0]?.transcript || "";
+        if (res.isFinal) finalTextRef.current += txt + " ";
+        else interim += txt;
+      }
+
+      const merged = (finalTextRef.current + interim).trim();
+      if (!merged) return;
+
+      const contextHit = detectContextTrigger(merged);
+      const shouldHelp = shouldBridgeToBooking({
+        contextHit,
+        navRisk,
+      });
+
+      if (shouldHelp && !bookingOpen) {
+        // One calm sentence – no interruption, no command needed
+        speak(
+          "Mogu pomoći. Vidim otežane uvjete i moguće kašnjenje. Želite da provjerim opcije?",
+          { priority: "normal" }
+        );
+        setBookingSeed(merged);
+        setBookingOpen(true);
+      }
+    };
+
+    r.onend = () => {
+      try {
+        r.start();
+      } catch {}
+    };
+
+    try {
+      r.start();
+    } catch {}
+
+    return () => {
+      try {
+        r.stop();
+      } catch {}
+      recRef.current = null;
+    };
+  }, [navActive, navRisk, bookingOpen]);
+
+  /* =========================================================
+     SIMULATED NAV RISK (REMOVE WHEN REAL ENGINE FEEDS IT)
+     ========================================================= */
+  useEffect(() => {
+    // demo: after 15s simulate snow / risk
+    const tmr = setTimeout(() => {
+      setNavRisk(true);
+      setCriticalTicker({
+        active: true,
+        text: "POJAČAN SNIJEG NA RUTI — MOGUĆE KAŠNJENJE",
+      });
+      speak(
+        "Upozorenje. Pojačan snijeg na ruti. Preporučujem povećanje razmaka.",
+        { priority: "critical" }
+      );
+    }, 15000);
+
+    return () => clearTimeout(tmr);
+  }, []);
+
+  /* =========================================================
+     UI
+     ========================================================= */
   return (
-    <div style={styles.app}>
-      {/* HEADER */}
-      <header style={styles.header}>
-        <div>
-          <div style={styles.logo}>TBW AI PREMIUM</div>
-          <div style={styles.sub}>Navigator · Safety · Booking</div>
+    <div className="tbw-app-root">
+      {/* FIXED HEADER */}
+      <header className="tbw-header">
+        <div className="tbw-logo">TBW AI PREMIUM</div>
+        <div className="tbw-actions">
+          <button
+            className="tbw-btn"
+            onClick={() => setParentalOpen(true)}
+          >
+            Family / Safety
+          </button>
         </div>
-        <div style={styles.status}>LIVE · TRIAL</div>
       </header>
 
       {/* TICKER */}
-      <div style={styles.ticker}>
-        <div style={styles.tickerInner}>
-          Live traffic · Weather · Safety · Events · Booking · TBW AI
-        </div>
-      </div>
+      <TickerNav critical={criticalTicker} />
 
-      {/* HERO + SEARCH */}
-      <section style={styles.hero}>
-        <div style={styles.heroOverlay}>
-          <h1 style={styles.city}>Paris</h1>
+      {/* HERO / NAVIGATION CORE */}
+      <main className="tbw-main">
+        <section className="tbw-hero">
+          <h1>AI Safety Navigation</h1>
+          <p>
+            Navigation is active. Booking, safety and concierge assist
+            automatically when needed.
+          </p>
 
-          <div style={styles.searchBox}>
-            <input
-              style={styles.searchInput}
-              placeholder="Ask TBW AI…"
-            />
-            <button style={styles.searchBtn}>AI</button>
+          <div className="tbw-nav-status">
+            <span className="dot green" />
+            Navigation running
           </div>
-        </div>
-      </section>
 
-      {/* SCROLL AREA */}
-      <main style={styles.scroll}>
-        <GridButton label="Navigation" onClick={() => setActiveWindow("nav")} />
-        <GridButton label="Booking" onClick={() => setActiveWindow("booking")} />
-        <GridButton label="Child Mode" onClick={() => setActiveWindow("child")} />
-        <GridButton label="SOS / Emergency" onClick={() => setActiveWindow("sos")} />
-        <GridButton label="Services" onClick={() => setActiveWindow("services")} />
-        <GridButton label="Events" onClick={() => setActiveWindow("events")} />
-        <GridButton label="Transport" onClick={() => setActiveWindow("transport")} />
-        <GridButton label="Cafés & Restaurants" onClick={() => setActiveWindow("food")} />
-        <GridButton label="Gas & Charging" onClick={() => setActiveWindow("fuel")} />
-        <GridButton label="Marine" onClick={() => setActiveWindow("marine")} />
-      </main>
+          <div className="tbw-manual-actions">
+            <button
+              className="tbw-btn-primary"
+              onClick={() => {
+                speak(
+                  "TBW se privremeno isključuje. U slučaju ponovne aktivacije, recite samo Hey TBW.",
+                  { priority: "normal" }
+                );
+                // SAFE MODE remains silently active (locked)
+              }}
+            >
+              ISKLJUČI (SAFE MODE)
+            </button>
 
-      {/* WINDOW */}
-      {activeWindow && (
-        <div style={styles.windowOverlay} onClick={() => setActiveWindow(null)}>
-          <div style={styles.window} onClick={(e) => e.stopPropagation()}>
-            <h2>{activeWindow.toUpperCase()}</h2>
-
-            {activeWindow === "booking" && (
-              <p>
-                AI receptionist active.  
-                Booking / Airbnb partner IDs are not yet connected.
-              </p>
-            )}
-
-            <button style={styles.closeBtn} onClick={() => setActiveWindow(null)}>
-              Close
+            <button
+              className="tbw-btn-secondary"
+              onClick={() => {
+                setBookingSeed("hotel");
+                setBookingOpen(true);
+              }}
+            >
+              OTVORI BOOKING
             </button>
           </div>
-        </div>
-      )}
+        </section>
+
+        {/* SCROLLABLE AREA BELOW SEARCH / HERO */}
+        <section className="tbw-scroll">
+          <h2>Status & Information</h2>
+          <p>
+            Ovdje idu dodatni paneli (route details, safety overlays,
+            explanations). Scroll je dozvoljen samo ispod hero dijela.
+          </p>
+        </section>
+      </main>
+
+      {/* ================= MODALS ================= */}
+
+      {/* LEGAL */}
+      <LegalGate
+        open={showLegal}
+        onAccepted={() => {
+          setShowLegal(false);
+          setShowRobot(true);
+        }}
+      />
+
+      {/* ROBOT */}
+      <RobotGate
+        open={showRobot}
+        onOk={() => {
+          setShowRobot(false);
+          setShowPerm(true);
+        }}
+      />
+
+      {/* PERMISSIONS */}
+      <PermissionGate
+        open={showPerm}
+        onOk={() => setShowPerm(false)}
+      />
+
+      {/* BOOKING 5★ CONCIERGE */}
+      <BookingModal
+        open={bookingOpen}
+        seedPrompt={bookingSeed}
+        cityFallback="Split"
+        onClose={() => setBookingOpen(false)}
+      />
+
+      {/* PARENTAL */}
+      <ParentalPanel
+        open={parentalOpen}
+        onDone={() => setParentalOpen(false)}
+      />
     </div>
   );
 }
-
-/* ================== COMPONENTS ================== */
-function GridButton({ label, onClick }) {
-  return (
-    <button style={styles.card} onClick={onClick}>
-      {label}
-    </button>
-  );
-}
-
-/* ================== STYLES ================== */
-const styles = {
-  app: {
-    background: "#050b08",
-    color: "#eafff6",
-    minHeight: "100vh",
-    fontFamily: "system-ui",
-  },
-
-  header: {
-    position: "fixed",
-    top: 0,
-    left: 0,
-    right: 0,
-    zIndex: 10,
-    padding: "12px 16px",
-    display: "flex",
-    justifyContent: "space-between",
-    background: "rgba(0,0,0,0.6)",
-    backdropFilter: "blur(12px)",
-    borderBottom: "1px solid rgba(60,255,179,0.15)",
-  },
-
-  logo: { fontWeight: 900, letterSpacing: "0.1em" },
-  sub: { fontSize: 12, opacity: 0.7 },
-
-  status: {
-    padding: "6px 12px",
-    borderRadius: 999,
-    background: "rgba(255,210,70,0.15)",
-    color: "#ffd246",
-    fontWeight: 800,
-  },
-
-  ticker: {
-    marginTop: 64,
-    background: "rgba(0,0,0,0.4)",
-    overflow: "hidden",
-    whiteSpace: "nowrap",
-  },
-
-  tickerInner: {
-    padding: "8px 16px",
-    animation: "marquee 18s linear infinite",
-  },
-
-  hero: {
-    height: 220,
-    background:
-      "url('/hero-paris.jpg') center/cover no-repeat",
-    position: "relative",
-  },
-
-  heroOverlay: {
-    position: "absolute",
-    inset: 0,
-    background: "rgba(0,0,0,0.55)",
-    display: "flex",
-    flexDirection: "column",
-    justifyContent: "center",
-    alignItems: "center",
-    gap: 14,
-  },
-
-  city: { fontSize: 36, margin: 0 },
-
-  searchBox: {
-    display: "flex",
-    gap: 8,
-    width: "90%",
-    maxWidth: 480,
-  },
-
-  searchInput: {
-    flex: 1,
-    padding: 12,
-    borderRadius: 999,
-    border: "none",
-  },
-
-  searchBtn: {
-    padding: "0 20px",
-    borderRadius: 999,
-    border: "none",
-    background: "#3cffb3",
-    fontWeight: 900,
-  },
-
-  scroll: {
-    padding: "16px",
-    marginTop: 220,
-    display: "grid",
-    gridTemplateColumns: "repeat(auto-fit,minmax(160px,1fr))",
-    gap: 12,
-  },
-
-  card: {
-    padding: 16,
-    borderRadius: 18,
-    background: "rgba(0,0,0,0.45)",
-    border: "1px solid rgba(255,255,255,0.08)",
-    color: "#eafff6",
-    fontWeight: 700,
-  },
-
-  windowOverlay: {
-    position: "fixed",
-    inset: 0,
-    background: "rgba(0,0,0,0.75)",
-    display: "flex",
-    justifyContent: "center",
-    alignItems: "center",
-    zIndex: 50,
-  },
-
-  window: {
-    background: "#07130f",
-    padding: 24,
-    borderRadius: 20,
-    width: "90%",
-    maxWidth: 500,
-  },
-
-  closeBtn: {
-    marginTop: 16,
-    padding: "8px 16px",
-    borderRadius: 999,
-    border: "none",
-  },
-};
 
