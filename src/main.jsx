@@ -1,12 +1,10 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
-import ConsentGate from "./tbw/core/ConsentGate";
+import "./tbw/core/TBWBootstrap";
 
 ReactDOM.createRoot(document.getElementById("root")).render(
   <React.StrictMode>
-    <ConsentGate>
-      <App />
-    </ConsentGate>
+    <App />
   </React.StrictMode>
 );
