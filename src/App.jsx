@@ -1,15 +1,13 @@
 import React, { useEffect, useState } from "react";
 import "./App.css";
 
-/* UI */
-import BookingModal from "./tbw/booking/BookingModal";
-
-/* GATES */
+/* Gates */
 import LocationGate from "./tbw/permissions/LocationGate";
 
-/* ============================
-   APP STATES
-   ============================ */
+/* Core UI */
+import BookingModal from "./tbw/booking/BookingModal";
+import MainSearch from "./tbw/search/MainSearch";
+
 const BOOT = "BOOT";
 const READY = "READY";
 const RUNNING = "RUNNING";
@@ -17,37 +15,36 @@ const RUNNING = "RUNNING";
 export default function App() {
   const [appState, setAppState] = useState(BOOT);
 
+  // location payload (non-blocking)
   const [location, setLocation] = useState(null);
+
+  // last voice/search context shared across app (NAV ↔ BOOKING ↔ SEARCH)
+  const [voiceContext, setVoiceContext] = useState(null);
+
+  // modals
   const [bookingOpen, setBookingOpen] = useState(false);
 
-  /* ============================
-     SILENT BOOT (NO AUDIO!)
-     ============================ */
+  /* ========== SILENT BOOT (NO AUDIO / NO MIC / NO LOOPS) ========== */
   useEffect(() => {
-    // NEMA GOVORA
-    // NEMA MIKROFONA
-    // NEMA GEO BLOKA
     setAppState(READY);
   }, []);
 
-  /* ============================
-     LOCATION GRANTED CALLBACK
-     ============================ */
+  /* ========== LOCATION CALLBACK ========== */
   const handleLocationGranted = (payload) => {
-    setLocation(payload);
+    setLocation(payload || { mode: "FALLBACK" });
     setAppState(RUNNING);
   };
 
-  /* ============================
-     RENDER
-     ============================ */
+  /* ========== OPEN BOOKING (ALWAYS CONTEXT-AWARE) ========== */
+  const openBooking = (ctx = null) => {
+    if (ctx) setVoiceContext(ctx);
+    setBookingOpen(true);
+  };
 
-  /* ---- BOOT (ne vidi se) ---- */
-  if (appState === BOOT) {
-    return null;
-  }
+  /* ---------------- BOOT ---------------- */
+  if (appState === BOOT) return null;
 
-  /* ---- READY: PERMISSION ---- */
+  /* ---------------- READY: LOCATION ---------------- */
   if (appState === READY) {
     return (
       <div className="tbw-app-root">
@@ -56,72 +53,64 @@ export default function App() {
     );
   }
 
-  /* ---- RUNNING: FULL APP ---- */
+  /* ---------------- RUNNING: FULL APP ---------------- */
   return (
     <div className="tbw-app-root">
-      {/* ================= HEADER ================= */}
+      {/* HEADER */}
       <header className="tbw-header">
         <div className="tbw-logo">TBW AI PREMIUM</div>
+
         <div className="tbw-actions">
-          <button
-            className="tbw-btn-secondary"
-            onClick={() => setBookingOpen(true)}
-          >
+          <button className="tbw-btn-secondary" onClick={() => openBooking(voiceContext)}>
             BOOKING
           </button>
         </div>
       </header>
 
-      {/* ================= TICKER ================= */}
+      {/* TICKER (idle by default) */}
       <div className="tbw-ticker tbw-ticker-idle">
         <div className="tbw-ticker-inner">
-          TBW EMERGENCY PULT • Safety-first navigation active
+          TBW EMERGENCY PULT • Safety-first navigation active •{" "}
+          {location?.mode ? `LOC:${location.mode}` : "LOC:—"}
         </div>
       </div>
 
-      {/* ================= MAIN ================= */}
+      {/* MAIN */}
       <main className="tbw-main">
-        {/* HERO / NAV CORE */}
+        {/* HERO */}
         <section className="tbw-hero">
-          <h1>NAVIGATION ACTIVE</h1>
+          <h1>TBW AI Search</h1>
           <p>
-            TBW sigurnosni navigacijski sustav je aktivan.
-            {location?.mode && (
-              <>
-                <br />
-                <b>Način lokacije:</b> {location.mode}
-              </>
-            )}
+            Human mode aktivan. Glas i tekst. Booking se otvara automatski kad ga zatražiš.
           </p>
 
           <div className="tbw-nav-status">
             <div className="dot green" />
-            SUSTAV AKTIVAN
+            SYSTEM RUNNING
           </div>
 
           <div className="tbw-manual-actions">
-            <button
-              className="tbw-btn-primary"
-              onClick={() => setBookingOpen(true)}
-            >
+            <button className="tbw-btn-primary" onClick={() => openBooking(voiceContext)}>
               OTVORI BOOKING
             </button>
           </div>
         </section>
 
-        {/* SCROLLABLE AREA */}
+        {/* SCROLLABLE CONTENT */}
         <section className="tbw-scroll">
-          <h2>Status</h2>
-          <p>
-            Navigacija, sigurnosni sustavi i booking engine su spremni.
-            Glas i mikrofon aktiviraju se isključivo ručno.
-          </p>
+          <MainSearch
+            // kad god search dobije kontekst, spremi ga globalno
+            onContextUpdate={(ctx) => setVoiceContext(ctx)}
+            // kad search prepozna booking intent, otvori booking odmah
+            onOpenBooking={(ctx) => openBooking(ctx)}
+          />
         </section>
       </main>
 
-      {/* ================= MODALS ================= */}
+      {/* MODALS */}
       <BookingModal
         open={bookingOpen}
+        context={voiceContext}
         onClose={() => setBookingOpen(false)}
       />
     </div>
