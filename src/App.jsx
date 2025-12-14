@@ -1,259 +1,128 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useState } from "react";
 import "./App.css";
 
-/* TBW CORE */
-import { t } from "./tbw/core/i18n";
-import { speak, makeRecognizer } from "./tbw/core/voice";
-import { detectContextTrigger, shouldBridgeToBooking } from "./tbw/core/contextBridge";
-
-/* GATES */
-import PermissionGate from "./tbw/ui/PermissionGate";
-import LegalGate, { legalAccepted } from "./tbw/ui/LegalGate";
-import RobotGate, { robotOk } from "./tbw/ui/RobotGate";
-
 /* UI */
-import TickerNav from "./tbw/ui/TickerNav";
-
-/* BOOKING */
 import BookingModal from "./tbw/booking/BookingModal";
 
-/* PARENTAL */
-import ParentalPanel from "./tbw/parental/ParentalPanel";
+/* GATES */
+import LocationGate from "./tbw/permissions/LocationGate";
 
-/* =========================================================
-   TBW AI PREMIUM — APP ROOT
-   ========================================================= */
+/* ============================
+   APP STATES
+   ============================ */
+const BOOT = "BOOT";
+const READY = "READY";
+const RUNNING = "RUNNING";
 
 export default function App() {
-  /* ---------- GLOBAL STATE ---------- */
-  const [navActive, setNavActive] = useState(true); // navigation always ON (locked)
-  const [navRisk, setNavRisk] = useState(false); // later fed by NavEngine (snow, closures, ETA drift)
+  const [appState, setAppState] = useState(BOOT);
 
-  /* ---------- GATES ---------- */
-  const [showLegal, setShowLegal] = useState(false);
-  const [showRobot, setShowRobot] = useState(false);
-  const [showPerm, setShowPerm] = useState(false);
-
-  /* ---------- BOOKING ---------- */
+  const [location, setLocation] = useState(null);
   const [bookingOpen, setBookingOpen] = useState(false);
-  const [bookingSeed, setBookingSeed] = useState("");
 
-  /* ---------- PARENTAL ---------- */
-  const [parentalOpen, setParentalOpen] = useState(false);
-
-  /* ---------- TICKER ---------- */
-  const [criticalTicker, setCriticalTicker] = useState(null);
-  // { active:true, text:"NESREĆA 23 km ispred – smanjite brzinu" }
-
-  /* ---------- VOICE CONTEXT LISTENER ---------- */
-  const recRef = useRef(null);
-  const finalTextRef = useRef("");
-
-  /* =========================================================
-     BOOT SEQUENCE — HARD LOCKED
-     ========================================================= */
+  /* ============================
+     SILENT BOOT (NO AUDIO!)
+     ============================ */
   useEffect(() => {
-    // Order is locked: LEGAL → ROBOT → PERMISSIONS
-    if (!legalAccepted()) {
-      setShowLegal(true);
-      return;
-    }
-    if (!robotOk()) {
-      setShowRobot(true);
-      return;
-    }
-    setShowPerm(true);
+    // NEMA GOVORA
+    // NEMA MIKROFONA
+    // NEMA GEO BLOKA
+    setAppState(READY);
   }, []);
 
-  /* =========================================================
-     CONTEXTUAL AUTO-CONCIERGE BRIDGE (CACB™)
-     Navigation listens, Booking joins ONLY if needed
-     ========================================================= */
-  useEffect(() => {
-    if (!navActive) return;
+  /* ============================
+     LOCATION GRANTED CALLBACK
+     ============================ */
+  const handleLocationGranted = (payload) => {
+    setLocation(payload);
+    setAppState(RUNNING);
+  };
 
-    const r = makeRecognizer({ continuous: true });
-    if (!r) return;
+  /* ============================
+     RENDER
+     ============================ */
 
-    recRef.current = r;
-    finalTextRef.current = "";
+  /* ---- BOOT (ne vidi se) ---- */
+  if (appState === BOOT) {
+    return null;
+  }
 
-    r.onresult = (e) => {
-      let interim = "";
-      for (let i = e.resultIndex; i < e.results.length; i++) {
-        const res = e.results[i];
-        const txt = res[0]?.transcript || "";
-        if (res.isFinal) finalTextRef.current += txt + " ";
-        else interim += txt;
-      }
+  /* ---- READY: PERMISSION ---- */
+  if (appState === READY) {
+    return (
+      <div className="tbw-app-root">
+        <LocationGate onGranted={handleLocationGranted} />
+      </div>
+    );
+  }
 
-      const merged = (finalTextRef.current + interim).trim();
-      if (!merged) return;
-
-      const contextHit = detectContextTrigger(merged);
-      const shouldHelp = shouldBridgeToBooking({
-        contextHit,
-        navRisk,
-      });
-
-      if (shouldHelp && !bookingOpen) {
-        // One calm sentence – no interruption, no command needed
-        speak(
-          "Mogu pomoći. Vidim otežane uvjete i moguće kašnjenje. Želite da provjerim opcije?",
-          { priority: "normal" }
-        );
-        setBookingSeed(merged);
-        setBookingOpen(true);
-      }
-    };
-
-    r.onend = () => {
-      try {
-        r.start();
-      } catch {}
-    };
-
-    try {
-      r.start();
-    } catch {}
-
-    return () => {
-      try {
-        r.stop();
-      } catch {}
-      recRef.current = null;
-    };
-  }, [navActive, navRisk, bookingOpen]);
-
-  /* =========================================================
-     SIMULATED NAV RISK (REMOVE WHEN REAL ENGINE FEEDS IT)
-     ========================================================= */
-  useEffect(() => {
-    // demo: after 15s simulate snow / risk
-    const tmr = setTimeout(() => {
-      setNavRisk(true);
-      setCriticalTicker({
-        active: true,
-        text: "POJAČAN SNIJEG NA RUTI — MOGUĆE KAŠNJENJE",
-      });
-      speak(
-        "Upozorenje. Pojačan snijeg na ruti. Preporučujem povećanje razmaka.",
-        { priority: "critical" }
-      );
-    }, 15000);
-
-    return () => clearTimeout(tmr);
-  }, []);
-
-  /* =========================================================
-     UI
-     ========================================================= */
+  /* ---- RUNNING: FULL APP ---- */
   return (
     <div className="tbw-app-root">
-      {/* FIXED HEADER */}
+      {/* ================= HEADER ================= */}
       <header className="tbw-header">
         <div className="tbw-logo">TBW AI PREMIUM</div>
         <div className="tbw-actions">
           <button
-            className="tbw-btn"
-            onClick={() => setParentalOpen(true)}
+            className="tbw-btn-secondary"
+            onClick={() => setBookingOpen(true)}
           >
-            Family / Safety
+            BOOKING
           </button>
         </div>
       </header>
 
-      {/* TICKER */}
-      <TickerNav critical={criticalTicker} />
+      {/* ================= TICKER ================= */}
+      <div className="tbw-ticker tbw-ticker-idle">
+        <div className="tbw-ticker-inner">
+          TBW EMERGENCY PULT • Safety-first navigation active
+        </div>
+      </div>
 
-      {/* HERO / NAVIGATION CORE */}
+      {/* ================= MAIN ================= */}
       <main className="tbw-main">
+        {/* HERO / NAV CORE */}
         <section className="tbw-hero">
-          <h1>AI Safety Navigation</h1>
+          <h1>NAVIGATION ACTIVE</h1>
           <p>
-            Navigation is active. Booking, safety and concierge assist
-            automatically when needed.
+            TBW sigurnosni navigacijski sustav je aktivan.
+            {location?.mode && (
+              <>
+                <br />
+                <b>Način lokacije:</b> {location.mode}
+              </>
+            )}
           </p>
 
           <div className="tbw-nav-status">
-            <span className="dot green" />
-            Navigation running
+            <div className="dot green" />
+            SUSTAV AKTIVAN
           </div>
 
           <div className="tbw-manual-actions">
             <button
               className="tbw-btn-primary"
-              onClick={() => {
-                speak(
-                  "TBW se privremeno isključuje. U slučaju ponovne aktivacije, recite samo Hey TBW.",
-                  { priority: "normal" }
-                );
-                // SAFE MODE remains silently active (locked)
-              }}
-            >
-              ISKLJUČI (SAFE MODE)
-            </button>
-
-            <button
-              className="tbw-btn-secondary"
-              onClick={() => {
-                setBookingSeed("hotel");
-                setBookingOpen(true);
-              }}
+              onClick={() => setBookingOpen(true)}
             >
               OTVORI BOOKING
             </button>
           </div>
         </section>
 
-        {/* SCROLLABLE AREA BELOW SEARCH / HERO */}
+        {/* SCROLLABLE AREA */}
         <section className="tbw-scroll">
-          <h2>Status & Information</h2>
+          <h2>Status</h2>
           <p>
-            Ovdje idu dodatni paneli (route details, safety overlays,
-            explanations). Scroll je dozvoljen samo ispod hero dijela.
+            Navigacija, sigurnosni sustavi i booking engine su spremni.
+            Glas i mikrofon aktiviraju se isključivo ručno.
           </p>
         </section>
       </main>
 
       {/* ================= MODALS ================= */}
-
-      {/* LEGAL */}
-      <LegalGate
-        open={showLegal}
-        onAccepted={() => {
-          setShowLegal(false);
-          setShowRobot(true);
-        }}
-      />
-
-      {/* ROBOT */}
-      <RobotGate
-        open={showRobot}
-        onOk={() => {
-          setShowRobot(false);
-          setShowPerm(true);
-        }}
-      />
-
-      {/* PERMISSIONS */}
-      <PermissionGate
-        open={showPerm}
-        onOk={() => setShowPerm(false)}
-      />
-
-      {/* BOOKING 5★ CONCIERGE */}
       <BookingModal
         open={bookingOpen}
-        seedPrompt={bookingSeed}
-        cityFallback="Split"
         onClose={() => setBookingOpen(false)}
-      />
-
-      {/* PARENTAL */}
-      <ParentalPanel
-        open={parentalOpen}
-        onDone={() => setParentalOpen(false)}
       />
     </div>
   );
