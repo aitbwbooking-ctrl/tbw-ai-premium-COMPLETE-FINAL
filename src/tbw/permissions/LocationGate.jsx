@@ -1,48 +1,43 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 export default function LocationGate({ onGranted }) {
-  const [status, setStatus] = useState("idle"); // idle | waiting | ok | fallback
+  const doneRef = useRef(false);
+  const [status, setStatus] = useState("idle"); // idle | working | done
 
-  const requestLocation = () => {
+  const finish = (payload) => {
+    if (doneRef.current) return;
+    doneRef.current = true;
+    setStatus("done");
+    onGranted(payload);
+  };
+
+  const request = () => {
+    setStatus("working");
+
+    // ⏱ HARD FAILSAFE — NIKAD NE BLOKIRAJ
+    setTimeout(() => {
+      finish({ mode: "FALLBACK_NO_GEO" });
+    }, 3500);
+
     if (!navigator.geolocation) {
-      setStatus("fallback");
-      onGranted({ mode: "DESKTOP_NO_GEO" });
+      finish({ mode: "NO_GEO_API" });
       return;
     }
 
-    setStatus("waiting");
-
-    let resolved = false;
-
-    const timeout = setTimeout(() => {
-      if (resolved) return;
-      resolved = true;
-      setStatus("fallback");
-      onGranted({ mode: "APPROXIMATE" });
-    }, 4000);
-
     navigator.geolocation.getCurrentPosition(
       (pos) => {
-        if (resolved) return;
-        resolved = true;
-        clearTimeout(timeout);
-        setStatus("ok");
-        onGranted({
-          mode: "PRECISE",
+        finish({
+          mode: "OK",
           lat: pos.coords.latitude,
           lon: pos.coords.longitude,
         });
       },
       () => {
-        if (resolved) return;
-        resolved = true;
-        clearTimeout(timeout);
-        setStatus("fallback");
-        onGranted({ mode: "DENIED_OR_UNAVAILABLE" });
+        finish({ mode: "DENIED_OR_UNAVAILABLE" });
       },
       {
-        enableHighAccuracy: false, // KLJUČNO za desktop
-        timeout: 3000,
+        enableHighAccuracy: false,
+        timeout: 2500,
         maximumAge: 60000,
       }
     );
@@ -53,11 +48,12 @@ export default function LocationGate({ onGranted }) {
       <h3>Lokacija</h3>
       <p>
         TBW koristi lokaciju za sigurnu navigaciju.
-        Na desktopu može se koristiti i približna lokacija.
+        Ako lokacija nije dostupna, aplikacija će nastaviti u sigurnom načinu.
       </p>
 
       <button
-        onClick={requestLocation}
+        onClick={request}
+        disabled={status === "working"}
         style={{
           width: "100%",
           padding: 14,
@@ -65,14 +61,9 @@ export default function LocationGate({ onGranted }) {
           fontWeight: 900,
         }}
       >
-        {status === "waiting" ? "Provjeravam lokaciju…" : "OMOGUĆI LOKACIJU"}
+        {status === "working" ? "Provjeravam…" : "OMOGUĆI LOKACIJU"}
       </button>
-
-      {status === "fallback" && (
-        <p style={{ marginTop: 12, opacity: 0.8 }}>
-          Koristi se približna lokacija (desktop način).
-        </p>
-      )}
     </div>
   );
 }
+
