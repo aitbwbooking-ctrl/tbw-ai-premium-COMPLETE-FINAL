@@ -1,206 +1,132 @@
 import { useEffect, useRef, useState } from "react";
-import "./App.css";
-
-/* =========================
-   TBW AI PREMIUM – STABLE
-   ========================= */
 
 export default function App() {
-  const [messages, setMessages] = useState([]);
-  const [input, setInput] = useState("");
+  const recognitionRef = useRef(null);
+  const startedRef = useRef(false);
+
+  const [text, setText] = useState("");
+  const [log, setLog] = useState([]);
   const [listening, setListening] = useState(false);
   const [city, setCity] = useState(null);
-  const [bookingOpen, setBookingOpen] = useState(false);
 
-  const recognitionRef = useRef(null);
-  const speakingRef = useRef(false);
-  const greetedRef = useRef(false);
-
-  /* ---------- SPEAK ---------- */
-  const speak = (text) => {
-    if (!window.speechSynthesis) return;
-
-    speakingRef.current = true;
-    recognitionRef.current?.stop();
-
-    const utter = new SpeechSynthesisUtterance(text);
-    utter.lang = "hr-HR";
-    utter.rate = 0.95;
-    utter.pitch = 1.1;
-
-    utter.onend = () => {
-      speakingRef.current = false;
-      startListening();
-    };
-
-    window.speechSynthesis.cancel();
-    window.speechSynthesis.speak(utter);
-  };
-
-  /* ---------- LISTEN ---------- */
-  const startListening = () => {
-    if (speakingRef.current) return;
-    if (!recognitionRef.current) return;
-
-    try {
-      recognitionRef.current.start();
-      setListening(true);
-    } catch {}
-  };
-
-  const stopListening = () => {
-    try {
-      recognitionRef.current?.stop();
-      setListening(false);
-    } catch {}
-  };
-
-  /* ---------- HANDLE USER ---------- */
-  const handleUser = (text) => {
-    if (!text) return;
-
-    setMessages((m) => [...m, { role: "user", text }]);
-
-    // CITY DETECTION
-    const cityMatch = text.match(/zagreb|split|rijeka|osijek|zadar/i);
-    if (cityMatch && !city) {
-      const detectedCity =
-        cityMatch[0].charAt(0).toUpperCase() + cityMatch[0].slice(1);
-      setCity(detectedCity);
-    }
-
-    // BOOKING TRIGGER
-    if (/smještaj|hotel|booking|apartman/i.test(text)) {
-      setBookingOpen(true);
-    }
-
-    respond(text);
-  };
-
-  /* ---------- AI RESPONSE ---------- */
-  const respond = (text) => {
-    let reply = "";
-
-    if (!city) {
-      reply = "Za koji grad tražite smještaj?";
-    } else if (!bookingOpen) {
-      reply = `Tražite smještaj u gradu ${city}. Koliko osoba dolazi i za koje datume?`;
-      setBookingOpen(true);
-    } else {
-      reply = `U redu. Tražim smještaj u gradu ${city}. Recite mi još datume i broj osoba.`;
-    }
-
-    setMessages((m) => [...m, { role: "ai", text: reply }]);
-    speak(reply);
-  };
-
-  /* ---------- INIT ---------- */
+  /* ---------- INIT SPEECH (CHROME HARD LOCK) ---------- */
   useEffect(() => {
+    if (startedRef.current) return;
+    startedRef.current = true;
+
     const SR =
-      window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) return;
+      window.webkitSpeechRecognition || window.SpeechRecognition;
+
+    if (!SR) {
+      console.warn("SpeechRecognition not supported");
+      return;
+    }
 
     const rec = new SR();
     rec.lang = "hr-HR";
     rec.continuous = true;
     rec.interimResults = false;
 
-    rec.onresult = (e) => {
-      if (speakingRef.current) return;
-      const transcript =
-        e.results[e.results.length - 1][0].transcript.trim();
-      handleUser(transcript);
+    rec.onstart = () => setListening(true);
+
+    rec.onend = () => {
+      setListening(false);
+      rec.start(); // AUTO CONTINUE
     };
 
-    rec.onerror = () => stopListening();
-    rec.onend = () => {
-      if (!speakingRef.current) startListening();
+    rec.onerror = () => {
+      setListening(false);
+      rec.start();
+    };
+
+    rec.onresult = (e) => {
+      const t = e.results[e.results.length - 1][0].transcript.trim();
+      handleInput(t, true);
     };
 
     recognitionRef.current = rec;
-
-    if (!greetedRef.current) {
-      greetedRef.current = true;
-      const greet = "Kako vam mogu pomoći?";
-      setMessages([{ role: "ai", text: greet }]);
-      speak(greet);
-    }
+    rec.start();
   }, []);
+
+  /* ---------- CORE LOGIC ---------- */
+  function handleInput(value, isVoice = false) {
+    if (!value) return;
+
+    setLog((l) => [...l, value]);
+
+    // DETECT CITY
+    const cityMatch = value.match(
+      /(zagreb|split|rijeka|zadar|osijek|pula)/i
+    );
+    if (cityMatch) {
+      setCity(cityMatch[0]);
+    }
+
+    // AUTO BOOKING
+    if (value.toLowerCase().includes("smještaj")) {
+      openBooking(city || cityMatch?.[0]);
+      speak(
+        `U redu. Za koliko osoba tražite smještaj u ${city ||
+          cityMatch?.[0]}?`
+      );
+      return;
+    }
+
+    // NORMAL RESPONSE
+    speak("Recite slobodno što vas zanima.");
+  }
+
+  /* ---------- SPEAK ---------- */
+  function speak(msg) {
+    const u = new SpeechSynthesisUtterance(msg);
+    u.lang = "hr-HR";
+    u.rate = 0.95;
+    u.pitch = 1.05;
+    speechSynthesis.cancel();
+    speechSynthesis.speak(u);
+  }
+
+  /* ---------- BOOKING ---------- */
+  function openBooking(c) {
+    if (!c) return;
+    const url = `https://www.booking.com/searchresults.html?ss=${encodeURIComponent(
+      c
+    )}`;
+    window.open(url, "_blank");
+  }
 
   /* ---------- UI ---------- */
   return (
-    <div className="app">
-      <header className="header">
-        <h1>TBW AI PREMIUM</h1>
-        <button onClick={() => setBookingOpen(true)}>BOOKING</button>
-      </header>
+    <div style={{ padding: 20, fontFamily: "sans-serif" }}>
+      <h2>TBW AI PREMIUM</h2>
+      <p>AI Safety Navigation</p>
 
-      <section className="hero">
-        <h2>AI Safety Navigation</h2>
-        <p>
-          Navigation is active. Booking, safety and concierge assist
-          automatically when needed.
-        </p>
-        <span className="status">● Navigation running</span>
-      </section>
-
-      <section className="chat">
-        {messages.map((m, i) => (
-          <div key={i} className={`msg ${m.role}`}>
-            {m.text}
-          </div>
-        ))}
-      </section>
-
-      <section className="input">
+      <div style={{ marginBottom: 10 }}>
         <input
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          placeholder="Upiši ili klikni 🎤 i reci što trebaš"
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          placeholder="Upiši ili govori"
         />
         <button
           onClick={() => {
-            handleUser(input);
-            setInput("");
+            handleInput(text, false);
+            setText("");
           }}
         >
           SEND
         </button>
-        <button
-          className={listening ? "mic active" : "mic"}
-          onClick={() =>
-            listening ? stopListening() : startListening()
-          }
-        >
-          🎤
-        </button>
-      </section>
+      </div>
 
-      {bookingOpen && (
-        <div className="modal">
-          <div className="modal-box">
-            <h3>TBW 5★ Booking Concierge</h3>
-            <p>
-              {city
-                ? `Pretražujem smještaj za grad ${city}.`
-                : "Odaberite grad."}
-            </p>
-            <button
-              onClick={() =>
-                window.open(
-                  `https://www.booking.com/searchresults.html?ss=${city || ""}`,
-                  "_blank"
-                )
-              }
-            >
-              Open booking search
-            </button>
-            <button onClick={() => setBookingOpen(false)}>
-              Zatvori
-            </button>
-          </div>
-        </div>
-      )}
+      <div>
+        <strong>Status:</strong>{" "}
+        {listening ? "🎤 Mikrofon aktivan" : "⏸️ Pauza"}
+      </div>
+
+      <ul>
+        {log.map((l, i) => (
+          <li key={i}>{l}</li>
+        ))}
+      </ul>
     </div>
   );
 }
