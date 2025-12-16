@@ -7,44 +7,42 @@ export default function AISearch({ onOpenBooking }) {
 
   useEffect(() => {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) return;
+    if (!SR) {
+      alert("Ovaj preglednik ne podržava glasovno prepoznavanje.");
+      return;
+    }
 
     const rec = new SR();
-    rec.lang = navigator.language || "hr-HR";
-    rec.continuous = true;
+    rec.lang = "hr-HR";
+    rec.continuous = false;          // ⬅️ KLJUČNO za Android
     rec.interimResults = false;
     rec.maxAlternatives = 1;
 
-    rec.onresult = (e) => {
-      const last = e.results?.[e.results.length - 1];
-      const transcript = last?.[0]?.transcript?.trim();
-      if (!transcript) return;
+    rec.onstart = () => {
+      setListening(true);
+    };
 
+    rec.onresult = (e) => {
+      const transcript = e.results[0][0].transcript;
       setText(transcript);
 
-      // AUTO-AKCIJA: ako user kaže "booking", "rezerviraj", "apartman", otvori booking
       const t = transcript.toLowerCase();
       if (
         t.includes("booking") ||
         t.includes("rezerv") ||
-        t.includes("apartman") ||
-        t.includes("hotel")
+        t.includes("hotel") ||
+        t.includes("apartman")
       ) {
         onOpenBooking?.();
       }
     };
 
     rec.onerror = () => {
-      // ništa agresivno - web SR zna “aborted/no-speech”
+      setListening(false);
     };
 
     rec.onend = () => {
-      // Ako je mic uključen, pokušaj nastaviti (ali bez spam start-a)
-      if (listening) {
-        try {
-          rec.start();
-        } catch {}
-      }
+      setListening(false); // ⬅️ NE restartamo automatski
     };
 
     recRef.current = rec;
@@ -53,48 +51,29 @@ export default function AISearch({ onOpenBooking }) {
       try {
         rec.stop();
       } catch {}
-      recRef.current = null;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [listening]);
+  }, [onOpenBooking]);
 
-  const toggleMic = async () => {
-    const rec = recRef.current;
-    if (!rec) {
-      alert("Mikrofon nije podržan na ovom browseru. Koristi Chrome.");
+  const startMic = async () => {
+    try {
+      await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch {
+      alert("TBW treba dozvolu za mikrofon.");
       return;
     }
 
-    if (!listening) {
-      // user gesture → traži browser permission za mic (stabilno)
-      try {
-        await navigator.mediaDevices.getUserMedia({ audio: true });
-      } catch {
-        alert("TBW ne može raditi bez dozvole za mikrofon.");
-        return;
-      }
-
-      setListening(true);
-      try {
-        rec.start();
-      } catch {}
-    } else {
-      setListening(false);
-      try {
-        rec.stop();
-      } catch {}
-    }
+    try {
+      recRef.current.start(); // ⬅️ user click → dozvoljeno
+    } catch {}
   };
 
   const send = () => {
-    // Ovdje kasnije vežemo TBW AI logiku; sad samo stabiliziramo input/mic
-    // Za sada: ako user upiše/izgovori "booking" → otvori booking
-    const t = (text || "").toLowerCase();
+    const t = text.toLowerCase();
     if (
       t.includes("booking") ||
       t.includes("rezerv") ||
-      t.includes("apartman") ||
-      t.includes("hotel")
+      t.includes("hotel") ||
+      t.includes("apartman")
     ) {
       onOpenBooking?.();
     }
@@ -109,10 +88,10 @@ export default function AISearch({ onOpenBooking }) {
           className="tbw-input"
           value={text}
           onChange={(e) => setText(e.target.value)}
-          placeholder="Upiši ili klikni 🎤 i reci što trebaš…"
+          placeholder="Upiši ili klikni 🎤 i govori…"
         />
 
-        <button className="tbw-mic" onClick={toggleMic} aria-label="Mic">
+        <button className="tbw-mic" onClick={startMic}>
           {listening ? "🔴" : "🎤"}
         </button>
 
@@ -123,9 +102,10 @@ export default function AISearch({ onOpenBooking }) {
 
       <div className="tbw-hint">
         {listening
-          ? "Mikrofon je aktivan. Pričaj normalno."
-          : "Klikni 🎤 za glas ili koristi tipkovnicu."}
+          ? "Slušam… govori sada."
+          : "Klikni 🎤 za glasovno pretraživanje."}
       </div>
     </section>
   );
 }
+
