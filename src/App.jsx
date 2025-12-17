@@ -732,3 +732,8 @@ export default function App() {
     cursor: "pointer",
     fontWeight: 800,
     letterSpacing: 0
+        </div>
+      </Modal>
+    </div>
+  );
+}
