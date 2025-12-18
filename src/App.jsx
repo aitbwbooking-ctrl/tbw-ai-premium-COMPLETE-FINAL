@@ -743,4 +743,1082 @@ async function requestNotifications() {
 
 /* ==============================
    6) VOICE (SpeechRecognition) + TTS
- 
+   ============================== */
+
+function pickBestVoice(voices, langPrefix = "hr") {
+  if (!voices || !voices.length) return null;
+  const v = voices.filter((x) => (x.lang || "").toLowerCase().startsWith(langPrefix.toLowerCase()));
+  const list = v.length ? v : voices;
+
+  // prefer "Google" / "Natural" / non-male hints if present
+  const preferred = list.find((x) => /google|natural/i.test(x.name || "") && !/male/i.test(x.name || ""));
+  if (preferred) return preferred;
+
+  const nonMale = list.find((x) => !/male/i.test(x.name || ""));
+  return nonMale || list[0] || null;
+}
+
+function beepTriple() {
+  // three quick beeps
+  try {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    const ctx = new AudioCtx();
+    const makeBeep = (t0) => {
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+      o.type = "sine";
+      o.frequency.value = 880;
+      o.connect(g);
+      g.connect(ctx.destination);
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.exponentialRampToValueAtTime(0.15, t0 + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.12);
+      o.start(t0);
+      o.stop(t0 + 0.13);
+    };
+    const t = ctx.currentTime + 0.02;
+    makeBeep(t);
+    makeBeep(t + 0.18);
+    makeBeep(t + 0.36);
+    setTimeout(() => ctx.close(), 900);
+  } catch {}
+}
+
+/* ==============================
+   7) MAIN APP
+   ============================== */
+
+export default function App() {
+  // tier
+  const [tierState, setTierState] = useState(() => initTierState());
+  const tier = useMemo(() => computeTier(tierState), [tierState]);
+
+  useEffect(() => {
+    const computed = computeTier(tierState);
+    if (computed !== tierState.tier) {
+      const updated = { ...tierState, tier: computed };
+      setTierState(updated);
+      LS.set(TBW_TIER_KEY, updated);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // gates
+  const [gate, setGate] = useGateState();
+
+  // UI states
+  const [typed, setTyped] = useState("");
+  const [status, setStatus] = useState("Spremno.");
+  const [micOn, setMicOn] = useState(false);
+  const [lastHeard, setLastHeard] = useState("");
+  const [log, setLog] = useState([]); // {role:'user'|'assistant', text, ts}
+
+  // context memory
+  const [ctx, setCtx] = useState({
+    city: DEFAULT_CITY,
+    guests: null,
+    checkin: null,
+    checkout: null,
+    placeType: null,
+    lastIntent: null, // "booking" | "navigation" | etc
+    awaiting: null, // "city" | "guests" | "dates" | "type"
+  });
+
+  // booking modal
+  const [bookingOpen, setBookingOpen] = useState(false);
+  const [bookingUrl, setBookingUrl] = useState("");
+  const [bookingSummary, setBookingSummary] = useState({
+    said: "",
+    city: DEFAULT_CITY,
+    guests: null,
+    checkin: null,
+    checkout: null,
+    placeType: null,
+  });
+
+  // alarm consent (state-level)
+  const [alarmEnabled, setAlarmEnabled] = useState(() => LS.get("tbw_alarm_enabled_v1", false));
+  useEffect(() => LS.set("tbw_alarm_enabled_v1", alarmEnabled), [alarmEnabled]);
+
+  // speech refs
+  const SpeechRecognition = useMemo(() => {
+    if (typeof window === "undefined") return null;
+    return window.SpeechRecognition || window.webkitSpeechRecognition || null;
+  }, []);
+  const canVoice = !!SpeechRecognition;
+  const canTTS = typeof window !== "undefined" && "speechSynthesis" in window;
+
+  const recogRef = useRef(null);
+  const shouldListenRef = useRef(false);
+  const speakingRef = useRef(false);
+
+  const finalFlushTimerRef = useRef(null);
+  const restartTimerRef = useRef(null);
+  const lastFinalRef = useRef({ text: "", ts: 0 });
+
+  // voices
+  const [voices, setVoices] = useState([]);
+  useEffect(() => {
+    if (!canTTS) return;
+    const load = () => {
+      try {
+        const v = window.speechSynthesis.getVoices();
+        if (v && v.length) setVoices(v);
+      } catch {}
+    };
+    load();
+    const id = setInterval(load, 800);
+    setTimeout(() => clearInterval(id), 5000);
+    return () => clearInterval(id);
+  }, [canTTS]);
+
+  const tbwVoice = useMemo(() => pickBestVoice(voices, "hr"), [voices]);
+
+  const pushLog = (role, text) => {
+    setLog((prev) => [...prev, { role, text, ts: Date.now() }]);
+  };
+
+  /* ---------- TTS ---------- */
+  const speak = async (text) => {
+    if (!canTTS || !text) return;
+    speakingRef.current = true;
+
+    try {
+      // avoid feedback loop
+      try {
+        recogRef.current?.abort?.();
+      } catch {}
+
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = DEFAULT_CITY ? "hr-HR" : "en-US";
+      u.rate = 1.0;
+      u.pitch = 1.08; // slightly softer
+      u.volume = 1.0;
+
+      if (tbwVoice) u.voice = tbwVoice;
+
+      setStatus("🔊 Govorim...");
+      await new Promise((resolve) => {
+        u.onend = resolve;
+        u.onerror = resolve;
+        window.speechSynthesis.cancel();
+        window.speechSynthesis.speak(u);
+      });
+    } finally {
+      speakingRef.current = false;
+      setStatus(micOn ? "🎤 Slušam..." : "Spremno.");
+      if (shouldListenRef.current) startRecognitionSafe();
+    }
+  };
+
+  /* ---------- Booking concierge logic ---------- */
+
+  const conciergeRecs = (city, placeType) => {
+    const c = city || DEFAULT_CITY;
+    const t = placeType ? ` (${placeType})` : "";
+    return [
+      { title: `Top izbor u ${c}${t}`, desc: "Filtriraj po ocjeni 8.5+ i provjeri parking / recepciju." },
+      { title: "Sigurnost i mir", desc: "Biraj dobro osvijetljenu lokaciju i provjeri recenzije o buci." },
+      { title: "Fleksibilan dolazak", desc: "Ako kasniš, traži self check-in ili 24h recepciju." },
+    ];
+  };
+
+  const computeNextQuestion = (next) => {
+    if (!next.city) return { awaiting: "city", text: "Koji grad? (npr. Karlovac, Pariz, Tokio)" };
+    if (!next.guests) return { awaiting: "guests", text: "Koliko osoba?" };
+    if (!next.checkin || !next.checkout) return { awaiting: "dates", text: "Koji su datumi? (npr. od 16.12 do 18.12)" };
+    if (!next.placeType) return { awaiting: "type", text: "Želiš hotel ili apartman?" };
+    return { awaiting: null, text: "OK. Želiš još filtriranje (cijena, parking, ocjena)?" };
+  };
+
+  const openBookingInApp = (nextCtx, saidText) => {
+    const url = buildBookingUrl({
+      city: nextCtx.city || DEFAULT_CITY,
+      guests: nextCtx.guests,
+      checkin: nextCtx.checkin,
+      checkout: nextCtx.checkout,
+      lang: "hr",
+    });
+
+    setBookingSummary({
+      said: saidText || "",
+      city: nextCtx.city || DEFAULT_CITY,
+      guests: nextCtx.guests,
+      checkin: nextCtx.checkin,
+      checkout: nextCtx.checkout,
+      placeType: nextCtx.placeType,
+    });
+    setBookingUrl(url);
+    setBookingOpen(true);
+  };
+
+  /* ---------- Central handler (TEXT + VOICE) ---------- */
+
+  const handleUserText = async (raw, { fromVoice = false } = {}) => {
+    const input = collapseSpaces(raw || "");
+    if (!input) return;
+
+    const text = fromVoice ? cleanVoiceText(input) : input;
+    if (!text) return;
+
+    pushLog("user", text);
+    setLastHeard(text);
+
+    const intent = detectIntent(text);
+    const detectedCity = detectCity(text);
+    const detectedGuests = parseGuests(text);
+    const dates = extractDates(text);
+    const detectedType = detectPlaceType(text);
+
+    let next = { ...ctx };
+
+    // update context
+    if (detectedCity) next.city = detectedCity;
+    if (detectedGuests) next.guests = detectedGuests;
+    if (dates.checkin) next.checkin = dates.checkin;
+    if (dates.checkout) next.checkout = dates.checkout;
+    if (detectedType) next.placeType = detectedType;
+
+    // booking flow
+    const bookingIntent = intent.accommodation || intent.wantsBooking || next.lastIntent === "booking";
+    if (bookingIntent) next.lastIntent = "booking";
+
+    setCtx(next);
+
+    if (bookingIntent) {
+      // open booking modal immediately when user asks for accommodation/booking
+      // BUT only if we have a city. If not, ask for city first.
+      if (!next.city) {
+        const msg = "Razumijem. Samo reci grad (npr. Karlovac, Pariz, Tokio) pa otvaram booking.";
+        pushLog("assistant", msg);
+        await speak(msg);
+        setCtx((p) => ({ ...p, awaiting: "city" }));
+        return;
+      }
+
+      // open booking inside TBW (exit available)
+      openBookingInApp(next, text);
+
+      // continue conversation (ask missing info)
+      const q = computeNextQuestion(next);
+      setCtx((p) => ({ ...p, awaiting: q.awaiting }));
+
+      let msg = `U redu. Otvaram Booking za ${next.city}.`;
+      if (next.guests) msg += ` ${next.guests} ${next.guests === 1 ? "osoba" : "osobe"}.`;
+      if (next.checkin && next.checkout) msg += ` Datumi: ${next.checkin} → ${next.checkout}.`;
+      if (next.placeType) msg += ` Tip: ${next.placeType}.`;
+      if (q.text) msg += ` ${q.text}`;
+
+      pushLog("assistant", msg);
+      await speak(msg);
+      return;
+    }
+
+    // default response
+    const msg = `Reci: "smještaj u ${ctx.city || DEFAULT_CITY}" ili "booking Pariz za 2 osobe".`;
+    pushLog("assistant", msg);
+    await speak(msg);
+  };
+
+  /* ---------- SpeechRecognition ---------- */
+
+  const startRecognitionSafe = () => {
+    if (!canVoice) {
+      setStatus("⚠️ Voice nije podržan u ovom pregledniku.");
+      return;
+    }
+    if (speakingRef.current) return;
+
+    if (restartTimerRef.current) {
+      clearTimeout(restartTimerRef.current);
+      restartTimerRef.current = null;
+    }
+    if (finalFlushTimerRef.current) {
+      clearTimeout(finalFlushTimerRef.current);
+      finalFlushTimerRef.current = null;
+    }
+
+    if (!recogRef.current) {
+      const r = new SpeechRecognition();
+      r.lang = "hr-HR";
+      r.continuous = true;
+      r.interimResults = true;
+      r.maxAlternatives = 1;
+
+      let finalBuffer = "";
+
+      r.onstart = () => setStatus("🎤 Slušam...");
+
+      r.onresult = (event) => {
+        if (!event?.results) return;
+
+        let interim = "";
+        let final = "";
+
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          const res = event.results[i];
+          const txt = (res[0]?.transcript || "").trim();
+          if (!txt) continue;
+          if (res.isFinal) final += (final ? " " : "") + txt;
+          else interim += (interim ? " " : "") + txt;
+        }
+
+        if (interim) setStatus(`🎤 ${compressRepeatWords(interim, 1)}`);
+
+        if (final) {
+          finalBuffer = collapseSpaces((finalBuffer ? finalBuffer + " " : "") + final);
+          const cleaned = cleanVoiceText(finalBuffer);
+          setLastHeard(cleaned);
+
+          if (finalFlushTimerRef.current) clearTimeout(finalFlushTimerRef.current);
+          finalFlushTimerRef.current = setTimeout(() => {
+            const utter = cleanVoiceText(finalBuffer);
+            finalBuffer = "";
+
+            const now = Date.now();
+            const prev = lastFinalRef.current;
+            if (utter && (utter !== prev.text || now - prev.ts > 2200)) {
+              lastFinalRef.current = { text: utter, ts: now };
+              handleUserText(utter, { fromVoice: true });
+            }
+          }, 520);
+        }
+      };
+
+      r.onerror = (e) => {
+        const err = e?.error || "unknown";
+        if (err === "not-allowed" || err === "service-not-allowed") {
+          setStatus("⚠️ Mikrofon nije dopušten. Dozvoli mic u Chrome postavkama.");
+          shouldListenRef.current = false;
+          setMicOn(false);
+          return;
+        }
+        if (err === "no-speech") setStatus("🎤 Slušam...");
+        else if (err === "aborted") setStatus(micOn ? "🎤 Slušam..." : "Spremno.");
+        else setStatus(`⚠️ Voice: ${err}`);
+
+        if (shouldListenRef.current && !speakingRef.current) {
+          restartTimerRef.current = setTimeout(() => {
+            try {
+              r.start();
+            } catch {}
+          }, 650);
+        }
+      };
+
+      r.onend = () => {
+        if (shouldListenRef.current && !speakingRef.current) {
+          restartTimerRef.current = setTimeout(() => {
+            try {
+              r.start();
+            } catch {}
+          }, 450);
+        } else {
+          setStatus("Spremno.");
+        }
+      };
+
+      recogRef.current = r;
+    }
+
+    try {
+      recogRef.current.start();
+      setMicOn(true);
+    } catch {
+      setMicOn(true);
+    }
+  };
+
+  const stopRecognition = () => {
+    shouldListenRef.current = false;
+    setMicOn(false);
+    setStatus("Spremno.");
+
+    if (restartTimerRef.current) {
+      clearTimeout(restartTimerRef.current);
+      restartTimerRef.current = null;
+    }
+    if (finalFlushTimerRef.current) {
+      clearTimeout(finalFlushTimerRef.current);
+      finalFlushTimerRef.current = null;
+    }
+
+    try {
+      recogRef.current?.stop?.();
+    } catch {}
+  };
+
+  const toggleMic = () => {
+    if (!micOn) {
+      shouldListenRef.current = true;
+      startRecognitionSafe();
+    } else {
+      stopRecognition();
+    }
+  };
+
+  /* ---------- Initial greeting ---------- */
+  useEffect(() => {
+    pushLog("assistant", `TBW AI PREMIUM spreman. Reci: "smještaj u Karlovcu" ili "booking Pariz za 2 osobe".`);
+    setStatus("Spremno.");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /* ---------- Mobile mic resume hint after returning from booking ---------- */
+  useEffect(() => {
+    const onVis = () => {
+      if (document.visibilityState === "visible") {
+        if (shouldListenRef.current) {
+          // browser may still require a user gesture; we try anyway
+          setStatus("🎤 Dodirni mic za nastavak (mobile).");
+          try {
+            startRecognitionSafe();
+          } catch {}
+        }
+      }
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canVoice]);
+
+  /* ==============================
+     8) GATE FLOW UI
+     ============================== */
+
+  const gateBlocked = !gate.introDone || !gate.termsAccepted || !gate.robotOk || !gate.permsOk;
+
+  const runIntro = async () => {
+    // non-skippable simple intro (3.2s)
+    setGate((g) => ({ ...g, introDone: false }));
+    await sleep(3200);
+    setGate((g) => ({ ...g, introDone: true }));
+  };
+
+  const runPermissions = async () => {
+    // Mandatory for navigation/booking: Location + Microphone.
+    // Camera optional (but requested in spec, so we ask; if denied we still allow app but will show "camera limited").
+    setStatus("Tražim dozvole...");
+    const geo = await requestGeo();
+    const mic = await requestMic();
+    await requestCamOptional(); // optional, but asked
+
+    const ok = !!geo.ok && !!mic.ok;
+    setGate((g) => ({ ...g, permsOk: ok }));
+
+    if (!geo.ok) {
+      pushLog("assistant", "TBW ne može raditi bez lokacije. Uključi Location i pokušaj ponovno.");
+      await speak("TBW ne može raditi bez lokacije. Uključi lokaciju i pokušaj ponovno.");
+    } else if (!mic.ok) {
+      pushLog("assistant", "TBW ne može raditi bez mikrofona. Dozvoli mikrofon i pokušaj ponovno.");
+      await speak("TBW ne može raditi bez mikrofona. Dozvoli mikrofon i pokušaj ponovno.");
+    } else {
+      pushLog("assistant", "Dozvole su aktivne. Možeš koristiti TBW.");
+      await speak("Dozvole su aktivne. Možeš koristiti TBW.");
+      setStatus("Spremno.");
+    }
+  };
+
+  const askNotifConsent = async (accept) => {
+    if (accept) {
+      const res = await requestNotifications();
+      if (res.ok) {
+        setGate((g) => ({ ...g, notifConsent: "accepted" }));
+        setAlarmEnabled(true);
+        beepTriple();
+      } else {
+        setGate((g) => ({ ...g, notifConsent: "declined" }));
+        setAlarmEnabled(false);
+      }
+    } else {
+      setGate((g) => ({ ...g, notifConsent: "declined" }));
+      setAlarmEnabled(false);
+    }
+  };
+
+  /* ==============================
+     9) MAIN UI STYLES
+     ============================== */
+
+  const pageStyle = {
+    minHeight: "100vh",
+    background:
+      "radial-gradient(1200px 700px at 18% 10%, rgba(20,255,140,0.12), transparent 60%), radial-gradient(900px 600px at 82% 18%, rgba(60,160,255,0.12), transparent 60%), linear-gradient(180deg, #070A12 0%, #090B13 40%, #05060A 100%)",
+    color: "rgba(255,255,255,0.92)",
+    fontFamily:
+      'ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans", "Liberation Sans", sans-serif',
+  };
+
+  const fixedTopStyle = {
+    position: "sticky",
+    top: 0,
+    zIndex: 100,
+    padding: "12px 14px 10px",
+    background: "rgba(5,6,10,0.86)",
+    backdropFilter: "blur(10px)",
+    borderBottom: "1px solid rgba(255,255,255,0.08)",
+  };
+
+  const contentWrapStyle = {
+    maxWidth: 980,
+    margin: "0 auto",
+    padding: "0 14px 90px",
+  };
+
+  const headerRow = {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 12,
+  };
+
+  const brandStyle = { fontWeight: 950, letterSpacing: 1.8, fontSize: 14, opacity: 0.92 };
+
+  const heroStyle = {
+    marginTop: 12,
+    padding: 18,
+    borderRadius: 22,
+    border: "1px solid rgba(255,255,255,0.10)",
+    background: "linear-gradient(180deg, rgba(255,255,255,0.08), rgba(255,255,255,0.03))",
+    boxShadow: "0 20px 60px rgba(0,0,0,0.42)",
+    backdropFilter: "blur(10px)",
+  };
+
+  const heroTitleStyle = { fontSize: 42, lineHeight: 1.0, letterSpacing: 0.5, fontWeight: 950, margin: "6px 0 10px" };
+
+  const searchRowStyle = {
+    display: "grid",
+    gridTemplateColumns: "1fr auto auto",
+    gap: 10,
+    alignItems: "center",
+  };
+
+  const inputStyle = {
+    width: "100%",
+    padding: "12px 12px",
+    borderRadius: 14,
+    border: "1px solid rgba(255,255,255,0.12)",
+    background: "rgba(0,0,0,0.16)",
+    color: "rgba(255,255,255,0.92)",
+    outline: "none",
+    fontSize: 14,
+  };
+
+  const dockStyle = {
+    position: "fixed",
+    left: 0,
+    right: 0,
+    bottom: 0,
+    padding: "10px 14px",
+    background: "rgba(5,6,10,0.86)",
+    borderTop: "1px solid rgba(255,255,255,0.08)",
+    backdropFilter: "blur(10px)",
+    zIndex: 120,
+  };
+
+  const dockInner = {
+    maxWidth: 980,
+    margin: "0 auto",
+    display: "flex",
+    gap: 10,
+    alignItems: "center",
+    justifyContent: "space-between",
+  };
+
+  /* ==============================
+     10) GATE OVERLAY UI
+     ============================== */
+
+  const showIntroOverlay = !gate.introDone;
+  const showTermsOverlay = gate.introDone && (!gate.termsAccepted || !gate.robotOk);
+  const showPermsOverlay = gate.introDone && gate.termsAccepted && gate.robotOk && !gate.permsOk;
+
+  /* ==============================
+     11) MAIN RENDER
+     ============================== */
+
+  return (
+    <div style={pageStyle}>
+      {/* ====== FIXED TOP (Header + Ticker + Hero + Main Search) ====== */}
+      <div style={fixedTopStyle}>
+        <div style={{ maxWidth: 980, margin: "0 auto" }}>
+          <div style={headerRow}>
+            <div style={brandStyle}>TBW AI PREMIUM</div>
+
+            <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap", justifyContent: "flex-end" }}>
+              {tier === "PREMIUM" ? (
+                <Chip tone="good">
+                  <span style={{ width: 8, height: 8, borderRadius: 99, background: "rgba(46,204,113,0.95)", boxShadow: "0 0 10px rgba(46,204,113,0.95)" }} />
+                  PREMIUM
+                </Chip>
+              ) : tier === "DEMO" ? (
+                <Chip tone="warn">
+                  <span style={{ width: 8, height: 8, borderRadius: 99, background: "rgba(241,196,15,0.95)", boxShadow: "0 0 10px rgba(241,196,15,0.95)" }} />
+                  DEMO
+                </Chip>
+              ) : (
+                <Chip tone="warn">
+                  <span style={{ width: 8, height: 8, borderRadius: 99, background: "rgba(241,196,15,0.95)", boxShadow: "0 0 10px rgba(241,196,15,0.95)" }} />
+                  FREE TRIAL (3D)
+                </Chip>
+              )}
+
+              <Button
+                variant="ghost"
+                onClick={() => {
+                  // manual open booking with current context
+                  openBookingInApp(ctx, "Manual booking");
+                  speak(`Otvaram Booking za ${ctx.city || DEFAULT_CITY}.`);
+                }}
+                title="Open booking"
+                disabled={gateBlocked}
+              >
+                BOOKING
+              </Button>
+
+              <Button variant="primary" onClick={toggleMic} title="Mic (continuous)" disabled={gateBlocked || !canVoice}>
+                {micOn ? "⏹ MIC" : "🎤 MIC"}
+              </Button>
+            </div>
+          </div>
+
+          {/* Ticker */}
+          <div style={{ marginTop: 10 }}>
+            {alarmEnabled ? (
+              <Ticker tone="good" text={`TBW EMERGENCY PULT • Alarms enabled • Location-based alerts active`} />
+            ) : (
+              <Ticker tone="warn" text={`TBW EMERGENCY PULT • No active emergency alerts • Enable in settings if you want`} />
+            )}
+          </div>
+
+          {/* Hero */}
+          <div style={heroStyle}>
+            <div style={heroTitleStyle}>
+              AI Safety
+              <br />
+              Navigation
+            </div>
+            <div style={{ fontSize: 14, opacity: 0.8, maxWidth: 620, lineHeight: 1.45 }}>
+              Navigation + Booking concierge + safety logic in one flow. Mic = conversation. SEND = typing only.
+            </div>
+
+            <div style={{ marginTop: 12, display: "flex", gap: 10, flexWrap: "wrap" }}>
+              <Chip tone="good">📍 City: {ctx.city || DEFAULT_CITY}</Chip>
+              <Chip tone={micOn ? "good" : "neutral"}>🎤 {micOn ? "Mic ON" : "Mic OFF"}</Chip>
+              <Chip>👥 {ctx.guests ? `${ctx.guests} osobe` : "gosti: ?"}</Chip>
+              <Chip>📅 {ctx.checkin && ctx.checkout ? `${ctx.checkin} → ${ctx.checkout}` : "datumi: ?"}</Chip>
+              <Chip>🏨 {ctx.placeType || "tip: ?"}</Chip>
+            </div>
+
+            {/* Main AI Search (fixed area) */}
+            <div style={{ marginTop: 14 }}>
+              <Card title="TBW AI Search">
+                <div style={searchRowStyle}>
+                  <input
+                    value={typed}
+                    onChange={(e) => setTyped(e.target.value)}
+                    placeholder='Upiši (SEND) ili reci (MIC): "smještaj u Parizu", "booking Tokio za 2 osobe"...'
+                    style={inputStyle}
+                    disabled={gateBlocked}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        if (!typed.trim()) return;
+                        const t = typed.trim();
+                        setTyped("");
+                        handleUserText(t, { fromVoice: false });
+                      }
+                    }}
+                  />
+
+                  <Button
+                    variant="ghost"
+                    onClick={() => {
+                      if (!typed.trim()) return;
+                      const t = typed.trim();
+                      setTyped("");
+                      handleUserText(t, { fromVoice: false });
+                    }}
+                    disabled={gateBlocked}
+                    title="SEND (typing only)"
+                    style={{ minWidth: 110, padding: "12px 14px" }}
+                  >
+                    SEND
+                  </Button>
+
+                  <Button
+                    variant="primary"
+                    onClick={toggleMic}
+                    disabled={gateBlocked || !canVoice}
+                    title="MIC (continuous conversation)"
+                    style={{ minWidth: 110, padding: "12px 14px" }}
+                  >
+                    {micOn ? "⏹ STOP" : "🎤 TALK"}
+                  </Button>
+                </div>
+
+                <div style={{ marginTop: 10, fontSize: 13, opacity: 0.92 }}>
+                  Status: <b>{status}</b>
+                </div>
+
+                <div style={{ marginTop: 8, fontSize: 12, opacity: 0.78 }}>
+                  Čuo sam: <b>{lastHeard || "—"}</b>
+                  {!canVoice ? " • Voice nije podržan u ovom browseru." : ""}
+                </div>
+
+                <Hr />
+
+                <div style={{ fontSize: 12, opacity: 0.75, lineHeight: 1.35 }}>
+                  Mobile napomena: ako otvoriš druge tabove/appove, browser može pauzirati mic. Vrati se i dodirni 🎤.
+                </div>
+              </Card>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* ====== SCROLL AREA (below search) ====== */}
+      <div style={contentWrapStyle}>
+        <div style={{ height: 14 }} />
+
+        <Card title="Conversation">
+          <div style={{ display: "flex", flexDirection: "column", gap: 10, maxHeight: 420, overflow: "auto" }}>
+            {log.map((m) => (
+              <div
+                key={m.ts + m.role}
+                style={{
+                  alignSelf: m.role === "user" ? "flex-end" : "flex-start",
+                  maxWidth: "92%",
+                  borderRadius: 16,
+                  padding: "10px 12px",
+                  background: m.role === "user" ? "rgba(46, 204, 113, 0.16)" : "rgba(255,255,255,0.06)",
+                  border: "1px solid rgba(255,255,255,0.10)",
+                  color: "rgba(255,255,255,0.92)",
+                  whiteSpace: "pre-wrap",
+                }}
+              >
+                <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 4 }}>{m.role === "user" ? "TI" : "TBW"}</div>
+                <div style={{ fontSize: 14, lineHeight: 1.35 }}>{m.text}</div>
+              </div>
+            ))}
+          </div>
+        </Card>
+
+        <div style={{ height: 14 }} />
+
+        <Card title="TBW Emergency Alerts (Consent)">
+          <div style={{ fontSize: 13, opacity: 0.86, lineHeight: 1.45 }}>
+            State-level alarms (earthquake, fire near you, terrorist attack, etc.) require explicit consent.
+            You can disable anytime to keep owner legally protected.
+          </div>
+
+          <div style={{ marginTop: 12, display: "flex", gap: 10, flexWrap: "wrap" }}>
+            <Chip tone={alarmEnabled ? "good" : "warn"}>ALARM: {alarmEnabled ? "ON" : "OFF"}</Chip>
+            <Chip>Consent: {gate.notifConsent}</Chip>
+          </div>
+
+          <div style={{ marginTop: 12, display: "flex", gap: 10, flexWrap: "wrap" }}>
+            <Button
+              variant="primary"
+              disabled={gateBlocked}
+              onClick={() => askNotifConsent(true)}
+              title="Enable alerts (asks notification permission)"
+            >
+              Enable Alerts
+            </Button>
+            <Button
+              variant="danger"
+              disabled={gateBlocked}
+              onClick={() => {
+                setAlarmEnabled(false);
+                setGate((g) => ({ ...g, notifConsent: "declined" }));
+              }}
+              title="Disable alerts"
+            >
+              Disable Alerts
+            </Button>
+            <Button
+              variant="ghost"
+              disabled={gateBlocked}
+              onClick={() => {
+                // demo "alarm"
+                if (alarmEnabled && "Notification" in window && Notification.permission === "granted") {
+                  try {
+                    new Notification("TBW ALERT", {
+                      body: "DEMO: Earthquake warning near your location. Follow official instructions.",
+                    });
+                    beepTriple();
+                  } catch {
+                    beepTriple();
+                    alert("DEMO ALERT (Notification blocked by browser UI).");
+                  }
+                } else {
+                  beepTriple();
+                  alert("DEMO ALERT (enable notifications for real UI).");
+                }
+              }}
+              title="Demo alert"
+            >
+              Demo Alert
+            </Button>
+          </div>
+        </Card>
+
+        <div style={{ marginTop: 16, opacity: 0.7, fontSize: 12, lineHeight: 1.4 }}>
+          TBW AI PREMIUM is an informational tool. It does not replace official emergency services, professional advice, or certified navigation systems.
+          Use at your own discretion.
+        </div>
+      </div>
+
+      {/* ====== DOCK ====== */}
+      <div style={dockStyle}>
+        <div style={dockInner}>
+          <div style={{ opacity: 0.88, fontWeight: 900 }}>Grad: {ctx.city || DEFAULT_CITY}</div>
+          <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+            <Button
+              variant="ghost"
+              disabled={gateBlocked}
+              onClick={() => {
+                openBookingInApp(ctx, "Manual booking");
+                speak(`Otvaram Booking za ${ctx.city || DEFAULT_CITY}.`);
+              }}
+            >
+              BOOKING
+            </Button>
+            <Button variant="primary" disabled={gateBlocked || !canVoice} onClick={toggleMic}>
+              {micOn ? "⏹ MIC" : "🎤 MIC"}
+            </Button>
+          </div>
+        </div>
+      </div>
+
+      {/* =========================
+          BOOKING MODAL (in-app)
+         ========================= */}
+      <Modal
+        open={bookingOpen}
+        title="TBW 5★ Booking Concierge"
+        onClose={() => {
+          setBookingOpen(false);
+          setStatus("Spremno.");
+        }}
+        width={980}
+      >
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          <div style={{ fontSize: 13, opacity: 0.86 }}>
+            Rekao si: <b>{bookingSummary.said || "—"}</b>
+          </div>
+
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+            <Chip tone="good">📍 {bookingSummary.city || DEFAULT_CITY}</Chip>
+            <Chip>👥 {bookingSummary.guests ?? "?"}</Chip>
+            <Chip>📅 {bookingSummary.checkin && bookingSummary.checkout ? `${bookingSummary.checkin} → ${bookingSummary.checkout}` : "?"}</Chip>
+            <Chip>🏨 {bookingSummary.placeType ?? "?"}</Chip>
+          </div>
+
+          <Hr />
+
+          <div style={{ fontWeight: 950, opacity: 0.92 }}>Preporuke</div>
+          <div style={{ display: "grid", gap: 10 }}>
+            {conciergeRecs(bookingSummary.city, bookingSummary.placeType).map((r) => (
+              <div
+                key={r.title}
+                style={{
+                  borderRadius: 16,
+                  border: "1px solid rgba(255,255,255,0.10)",
+                  background: "rgba(255,255,255,0.06)",
+                  padding: 12,
+                }}
+              >
+                <div style={{ fontWeight: 950, marginBottom: 4 }}>{r.title}</div>
+                <div style={{ opacity: 0.82, fontSize: 13, lineHeight: 1.35 }}>{r.desc}</div>
+              </div>
+            ))}
+          </div>
+
+          <Hr />
+
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+            <Button
+              variant="primary"
+              onClick={() => {
+                // refresh booking url based on current ctx (if user already said guests/dates after opening)
+                const url = buildBookingUrl({
+                  city: ctx.city || DEFAULT_CITY,
+                  guests: ctx.guests,
+                  checkin: ctx.checkin,
+                  checkout: ctx.checkout,
+                  lang: "hr",
+                });
+                setBookingUrl(url);
+                speak("Osvježavam rezultate prema zadnjim informacijama.");
+              }}
+            >
+              Refresh results
+            </Button>
+            <Button
+              variant="ghost"
+              onClick={() => {
+                setBookingOpen(false);
+                speak("Vratio sam te u TBW. Reci dalje što želiš.");
+              }}
+            >
+              EXIT → Back to TBW
+            </Button>
+          </div>
+
+          {/* In-app iframe so you can exit back without refreshing the whole app */}
+          <div
+            style={{
+              borderRadius: 16,
+              overflow: "hidden",
+              border: "1px solid rgba(255,255,255,0.12)",
+              background: "rgba(0,0,0,0.25)",
+              height: "min(70vh, 720px)",
+            }}
+          >
+            {bookingUrl ? (
+              <iframe
+                title="Booking"
+                src={bookingUrl}
+                style={{ width: "100%", height: "100%", border: 0 }}
+                sandbox="allow-forms allow-same-origin allow-scripts allow-popups allow-top-navigation-by-user-activation"
+              />
+            ) : (
+              <div style={{ padding: 14, opacity: 0.8 }}>Nema URL-a. Reci grad i kriterije pa otvaram.</div>
+            )}
+          </div>
+
+          <div style={{ fontSize: 12, opacity: 0.72, lineHeight: 1.35 }}>
+            Mic radi u TBW. Ako želiš nastaviti razgovor dok je Booking otvoren, ostani u ovoj aplikaciji i koristi 🎤.
+          </div>
+        </div>
+      </Modal>
+
+      {/* =========================
+          INTRO OVERLAY
+         ========================= */}
+      <Modal open={showIntroOverlay} title="TBW AI PREMIUM" onClose={() => {}} width={520}>
+        <div style={{ display: "grid", gap: 12, textAlign: "center" }}>
+          <div style={{ fontSize: 22, fontWeight: 950, letterSpacing: 1.2 }}>TBW AI PREMIUM</div>
+          <div style={{ opacity: 0.82, lineHeight: 1.4 }}>
+            Initializing safety systems… <br />
+            (non-skippable intro)
+          </div>
+          <div
+            style={{
+              height: 8,
+              borderRadius: 999,
+              border: "1px solid rgba(255,255,255,0.12)",
+              overflow: "hidden",
+              background: "rgba(255,255,255,0.06)",
+            }}
+          >
+            <div
+              style={{
+                height: "100%",
+                width: "100%",
+                background: "linear-gradient(90deg, rgba(46,204,113,0.35), rgba(241,196,15,0.35), rgba(60,160,255,0.35))",
+                animation: "tbwLoad 3.2s linear forwards",
+              }}
+            />
+          </div>
+          <style>{`@keyframes tbwLoad { 0%{transform:translateX(-100%)} 100%{transform:translateX(0%)} }`}</style>
+          <Button
+            variant="primary"
+            onClick={async () => {
+              // ensure it plays time-based, not instant
+              await runIntro();
+            }}
+          >
+            Start
+          </Button>
+        </div>
+      </Modal>
+
+      {/* =========================
+          TERMS + ROBOT OVERLAY
+         ========================= */}
+      <Modal open={showTermsOverlay} title="Terms & Access" onClose={() => {}} width={680}>
+        <div style={{ display: "grid", gap: 12 }}>
+          <div style={{ fontSize: 13, opacity: 0.86, lineHeight: 1.45 }}>
+            <b>IMPORTANT (English only):</b> TBW AI PREMIUM is an informational tool. It does not replace official emergency services,
+            certified navigation systems, or professional advice. The user is responsible for safe operation of any vehicle and compliance with local laws.
+          </div>
+
+          <div style={{ display: "grid", gap: 10 }}>
+            <label style={{ display: "flex", gap: 10, alignItems: "flex-start", cursor: "pointer" }}>
+              <input
+                type="checkbox"
+                checked={!!gate.termsAccepted}
+                onChange={(e) => setGate((g) => ({ ...g, termsAccepted: e.target.checked }))}
+              />
+              <span style={{ fontSize: 13, opacity: 0.9, lineHeight: 1.35 }}>
+                I accept the Terms, Safety Disclaimer, and understand TBW is informational.
+              </span>
+            </label>
+
+            <label style={{ display: "flex", gap: 10, alignItems: "flex-start", cursor: "pointer" }}>
+              <input
+                type="checkbox"
+                checked={!!gate.robotOk}
+                onChange={(e) => setGate((g) => ({ ...g, robotOk: e.target.checked }))}
+              />
+              <span style={{ fontSize: 13, opacity: 0.9, lineHeight: 1.35 }}>
+                I’m not a robot.
+              </span>
+            </label>
+          </div>
+
+          <Hr />
+
+          <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", flexWrap: "wrap" }}>
+            <Button
+              variant="primary"
+              disabled={!gate.termsAccepted || !gate.robotOk}
+              onClick={() => {
+                // proceed to permissions
+                speak("U redu. Sljedeći korak su dozvole za lokaciju i mikrofon.");
+              }}
+            >
+              Continue
+            </Button>
+          </div>
+        </div>
+      </Modal>
+
+      {/* =========================
+          PERMISSIONS OVERLAY
+         ========================= */}
+      <Modal open={showPermsOverlay} title="Permissions required" onClose={() => {}} width={680}>
+        <div style={{ display: "grid", gap: 12 }}>
+          <div style={{ fontSize: 13, opacity: 0.86, lineHeight: 1.45 }}>
+            TBW Navigation requires: <b>Location</b> + <b>Microphone</b>. Camera is requested for safety scenarios (optional).
+            If you disable Location in system settings, TBW must show “Cannot use TBW without location”.
+          </div>
+
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+            <Button variant="primary" onClick={runPermissions}>
+              Enable Location + Microphone
+            </Button>
+            <Button
+              variant="ghost"
+              onClick={() => {
+                speak("Bez dozvola TBW ne može raditi.");
+              }}
+            >
+              Cancel
+            </Button>
+          </div>
+
+          <Hr />
+
+          <div style={{ fontSize: 12, opacity: 0.75, lineHeight: 1.35 }}>
+            If permissions are blocked, open browser settings → Site settings → allow Location and Microphone.
+          </div>
+        </div>
+      </Modal>
+    </div>
+  );
+}
+
